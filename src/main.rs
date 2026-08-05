@@ -12,6 +12,8 @@ mod errors;
 mod logging;
 mod tui;
 
+mod scanner;
+
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
     crate::errors::init()?;

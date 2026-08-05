@@ -53,7 +53,9 @@ impl App {
             .tick_rate(self.tick_rate)
             .frame_rate(self.frame_rate);
         tui.enter()?;
-
+        if let Err(e) = crate::scanner::spawn(self.action_tx.clone()) {
+            tracing::error!("scanner init failed: {e}");
+        }
         for component in self.components.iter_mut() {
             component.register_action_handler(self.action_tx.clone())?;
         }
