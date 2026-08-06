@@ -47,6 +47,7 @@ impl App {
             ],
             should_quit: false,
             should_suspend: false,
+            seen_scans: HashSet::new(),
             config: Config::new()?,
             mode: Mode::Home,
             last_tick_key_events: Vec::new(),
