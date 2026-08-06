@@ -11,7 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 
 static GIF_BYTES: &[u8] = include_bytes!("../../assets/pocket-sand.gif");
-
+const ROTATE_GIF: bool = true;
 enum Display {
     Dashboard,
     Sand {
@@ -80,6 +80,7 @@ impl Home {
             self.gif_total += dur;
             let img: image::DynamicImage = frame.into_buffer().into();
             let img = img.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
+            let img = if ROTATE_GIF { img.rotate180() } else { img };
             self.frames
                 .push(picker.new_protocol(img, area, Resize::Fit(None))?);
         }
@@ -147,6 +148,9 @@ impl Component for Home {
                     frame: 0,
                     last_advance: Instant::now(),
                 };
+            }
+            Action::Dupe => {
+                self.log.push("DUPE  already sent — gif only".into());
             }
             Action::Scan(payload) => {
                 self.last_scan = Some(Instant::now());

@@ -12,6 +12,7 @@ pub enum Action {
     ClearScreen,
     Error(String),
     Help,
+    Dupe,
     XStatus(bool),
     XTx {
         ok: bool,

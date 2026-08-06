@@ -1,9 +1,11 @@
 use crossterm::event::KeyEvent;
 use ratatui::prelude::Rect;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tracing::{debug, info};
-
+// App field:
+// init: seen_scans: HashSet::new(),
 use crate::{
     action::Action,
     components::{Component, home::Home},
@@ -19,6 +21,7 @@ pub struct App {
     should_quit: bool,
     should_suspend: bool,
     mode: Mode,
+    seen_scans: HashSet<String>,
     last_tick_key_events: Vec<KeyEvent>,
     action_tx: mpsc::UnboundedSender<Action>,
     action_rx: mpsc::UnboundedReceiver<Action>,
@@ -159,11 +162,15 @@ impl App {
                 Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
                 Action::Render => self.render(tui)?,
                 Action::Scan(ref payload) => {
-                    if let Some(tx) = &self.mesh_tx {
-                        let _ = tx.send(payload.clone());
-                    }
-                    if let Some(tx) = &self.x_tx {
-                        let _ = tx.send(payload.clone());
+                    if self.seen_scans.insert(payload.clone()) {
+                        if let Some(tx) = &self.mesh_tx {
+                            let _ = tx.send(payload.clone());
+                        }
+                        if let Some(tx) = &self.x_tx {
+                            let _ = tx.send(payload.clone());
+                        }
+                    } else {
+                        let _ = self.action_tx.send(Action::Dupe);
                     }
                 }
                 _ => {}
