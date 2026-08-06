@@ -26,14 +26,21 @@ fn find_scanner() -> Option<Device> {
 }
 fn key_to_char(code: KeyCode, shift: bool) -> Option<char> {
     let raw = code.0;
+    // Linux keycodes are QWERTY-ordered, not alphabetical:
+    // KEY_Q..KEY_P = 16..=25, KEY_A..KEY_L = 30..=38, KEY_Z..KEY_M = 44..=50
+    let letter = |row: &[u8], idx: u16| -> char {
+        let c = row[idx as usize] as char;
+        if shift { c.to_ascii_uppercase() } else { c }
+    };
     let c = match raw {
-        r if (KeyCode::KEY_A.0..=KeyCode::KEY_Z.0).contains(&r) => {
-            let base = b'a' + (r - KeyCode::KEY_A.0) as u8;
-            if shift {
-                (base as char).to_ascii_uppercase()
-            } else {
-                base as char
-            }
+        r if (KeyCode::KEY_Q.0..=KeyCode::KEY_P.0).contains(&r) => {
+            letter(b"qwertyuiop", r - KeyCode::KEY_Q.0)
+        }
+        r if (KeyCode::KEY_A.0..=KeyCode::KEY_L.0).contains(&r) => {
+            letter(b"asdfghjkl", r - KeyCode::KEY_A.0)
+        }
+        r if (KeyCode::KEY_Z.0..=KeyCode::KEY_M.0).contains(&r) => {
+            letter(b"zxcvbnm", r - KeyCode::KEY_Z.0)
         }
         r if (KeyCode::KEY_1.0..=KeyCode::KEY_9.0).contains(&r) => {
             let d = r - KeyCode::KEY_1.0;

@@ -6,7 +6,7 @@ use tracing::{debug, info};
 
 use crate::{
     action::Action,
-    components::{Component, fps::FpsCounter, home::Home},
+    components::{Component, home::Home},
     config::Config,
     tui::{Event, Tui},
 };
@@ -22,6 +22,8 @@ pub struct App {
     last_tick_key_events: Vec<KeyEvent>,
     action_tx: mpsc::UnboundedSender<Action>,
     action_rx: mpsc::UnboundedReceiver<Action>,
+    mesh_tx: Option<mpsc::UnboundedSender<String>>,
+    x_tx: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,7 +38,10 @@ impl App {
         Ok(Self {
             tick_rate,
             frame_rate,
-            components: vec![Box::new(Home::new()), Box::new(FpsCounter::default())],
+            components: vec![
+                Box::new(Home::new()),
+                // Box::new(FpsCounter::default())
+            ],
             should_quit: false,
             should_suspend: false,
             config: Config::new()?,
@@ -44,6 +49,8 @@ impl App {
             last_tick_key_events: Vec::new(),
             action_tx,
             action_rx,
+            mesh_tx: None,
+            x_tx: None,
         })
     }
 
@@ -65,7 +72,12 @@ impl App {
         for component in self.components.iter_mut() {
             component.init(tui.size()?)?;
         }
-
+        let (x_tx, x_rx) = mpsc::unbounded_channel::<String>();
+        self.x_tx = Some(x_tx.clone());
+        crate::twitter::spawn(self.action_tx.clone(), x_rx);
+        let (mesh_tx, mesh_rx) = mpsc::unbounded_channel::<String>();
+        self.mesh_tx = Some(mesh_tx.clone());
+        crate::mesh::spawn(self.action_tx.clone(), mesh_rx);
         let action_tx = self.action_tx.clone();
         loop {
             self.handle_events(&mut tui).await?;
@@ -146,6 +158,14 @@ impl App {
                 Action::ClearScreen => tui.terminal.clear()?,
                 Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
                 Action::Render => self.render(tui)?,
+                Action::Scan(ref payload) => {
+                    if let Some(tx) = &self.mesh_tx {
+                        let _ = tx.send(payload.clone());
+                    }
+                    if let Some(tx) = &self.x_tx {
+                        let _ = tx.send(payload.clone());
+                    }
+                }
                 _ => {}
             }
             for component in self.components.iter_mut() {

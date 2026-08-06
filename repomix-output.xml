@@ -60,6 +60,8 @@ src/
   errors.rs
   logging.rs
   main.rs
+  mesh.rs
+  scanner.rs
   tui.rs
 .envrc
 .gitignore
@@ -72,15 +74,139 @@ README.md
 <files>
 This section contains the contents of the repository's files.
 
+<file path="src/mesh.rs">
+use std::time::Duration;
+
+use meshtastic::{
+    api::StreamApi,
+    packet::{PacketDestination, PacketRouter},
+    protobufs::{FromRadio, MeshPacket, PortNum, from_radio, mesh_packet},
+    types::NodeId,
+    utils,
+};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tracing::{error, info, warn};
+
+use crate::action::Action;
+
+/// 0 = DEFCONnect, 1 = HackerComms, 2 = NodeChat
+const MESH_CHANNEL: u32 = 0;
+const SERIAL_PORT: &str = "/dev/ttyACM0";
+/// LoRa text payloads top out ~230 bytes; stay well under
+const MAX_PAYLOAD_BYTES: usize = 200;
+
+/// Router required by send_text (used for packet echo bookkeeping).
+struct ScanRouter {
+    my_id: NodeId,
+}
+
+impl PacketRouter<(), std::io::Error> for ScanRouter {
+    fn handle_packet_from_radio(&mut self, _packet: FromRadio) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+    fn handle_mesh_packet(&mut self, _packet: MeshPacket) -> Result<(), std::io::Error> {
+        Ok(())
+    }
+    fn source_node_id(&self) -> NodeId {
+        self.my_id
+    }
+}
+
+fn truncate_payload(s: &str) -> String {
+    if s.len() <= MAX_PAYLOAD_BYTES {
+        return s.to_string();
+    }
+    let mut end = MAX_PAYLOAD_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
+/// Spawn the mesh worker task. `outbound` receives scan payloads to broadcast.
+/// Reconnects forever if the radio is missing or drops.
+pub fn spawn(action_tx: UnboundedSender<Action>, mut outbound: UnboundedReceiver<String>) {
+    tokio::spawn(async move {
+        loop {
+            let _ = action_tx.send(Action::MeshStatus(false));
+            match run_radio(&action_tx, &mut outbound).await {
+                Ok(()) => warn!("radio connection closed"),
+                Err(e) => warn!("radio error: {e}"),
+            }
+            let _ = action_tx.send(Action::MeshStatus(false));
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+async fn run_radio(
+    action_tx: &UnboundedSender<Action>,
+    outbound: &mut UnboundedReceiver<String>,
+) -> color_eyre::Result<()> {
+    let serial = utils::stream::build_serial_stream(SERIAL_PORT.to_string(), None, None, None)
+        .map_err(|e| color_eyre::eyre::eyre!("open {SERIAL_PORT}: {e}"))?;
+    let (mut decoded_listener, stream_api) = StreamApi::new().connect(serial).await;
+    let mut stream_api = stream_api.configure(utils::generate_rand_id()).await?;
+    info!("meshtastic radio configured on {SERIAL_PORT}");
+    let _ = action_tx.send(Action::MeshStatus(true));
+
+    let mut router = ScanRouter {
+        my_id: NodeId::new(0),
+    };
+
+    loop {
+        tokio::select! {
+            // Outbound: scan payloads from the TUI
+            Some(payload) = outbound.recv() => {
+                let text = truncate_payload(&payload);
+                match stream_api
+                    .send_text(&mut router, text.clone(), PacketDestination::Broadcast, true, MESH_CHANNEL.into())
+                    .await
+                {
+                    Ok(()) => { let _ = action_tx.send(Action::MeshTx { ok: true, text }); }
+                    Err(e) => {
+                        error!("mesh send failed: {e}");
+                        let _ = action_tx.send(Action::MeshTx { ok: false, text });
+                    }
+                }
+            }
+
+            // Inbound: packets from the radio
+            maybe_packet = decoded_listener.recv() => {
+                let Some(packet) = maybe_packet else {
+                    return Ok(()); // radio disconnected
+                };
+                match packet.payload_variant {
+                    Some(from_radio::PayloadVariant::MyInfo(info)) => {
+                        router.my_id = NodeId::new(info.my_node_num);
+                        info!("own node id: !{:08x}", info.my_node_num);
+                    }
+                    Some(from_radio::PayloadVariant::Packet(mp)) => {
+                        if let Some(mesh_packet::PayloadVariant::Decoded(data)) = mp.payload_variant {
+                            if data.portnum == PortNum::TextMessageApp as i32 {
+                                let text = String::from_utf8_lossy(&data.payload).to_string();
+                                let from = format!("!{:08x}", mp.from);
+                                let _ = action_tx.send(Action::MeshRx { from, text });
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+</file>
+
 <file path=".config/config.json5">
 {
   "keybindings": {
     "Home": {
-      "<q>": "Quit", // Quit the application
       "<Ctrl-d>": "Quit", // Another way to quit
       "<Ctrl-c>": "Quit", // Yet another way to quit
-      "<Ctrl-z>": "Suspend" // Suspend the application
-    },
+      "<Ctrl-z>": "Suspend", // Suspend the application
+ //  "<s>": "SandStart", 
+   },
   }
 }
 </file>
@@ -393,253 +519,6 @@ impl Component for FpsCounter {
         let span = Span::styled(message, Style::new().dim());
         let paragraph = Paragraph::new(span).right_aligned();
         frame.render_widget(paragraph, top);
-        Ok(())
-    }
-}
-</file>
-
-<file path="src/components/home.rs">
-use ratatui::{prelude::*, widgets::*};
-use tokio::sync::mpsc::UnboundedSender;
-
-use super::Component;
-use crate::{action::Action, config::Config};
-
-#[derive(Default)]
-pub struct Home {
-    command_tx: Option<UnboundedSender<Action>>,
-    config: Config,
-}
-
-impl Home {
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Component for Home {
-    fn register_action_handler(&mut self, tx: UnboundedSender<Action>) -> color_eyre::Result<()> {
-        self.command_tx = Some(tx);
-        Ok(())
-    }
-
-    fn register_config_handler(&mut self, config: Config) -> color_eyre::Result<()> {
-        self.config = config;
-        Ok(())
-    }
-
-    fn update(&mut self, action: Action) -> color_eyre::Result<Option<Action>> {
-        match action {
-            Action::Tick => {
-                // add any logic here that should run on every tick
-            }
-            Action::Render => {
-                // add any logic here that should run on every render
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
-    fn draw(&mut self, frame: &mut Frame, area: Rect) -> color_eyre::Result<()> {
-        frame.render_widget(Paragraph::new("hello world"), area);
-        Ok(())
-    }
-}
-</file>
-
-<file path="src/action.rs">
-use serde::{Deserialize, Serialize};
-use strum::Display;
-
-#[derive(Debug, Clone, PartialEq, Eq, Display, Serialize, Deserialize)]
-pub enum Action {
-    Tick,
-    Render,
-    Resize(u16, u16),
-    Suspend,
-    Resume,
-    Quit,
-    ClearScreen,
-    Error(String),
-    Help,
-}
-</file>
-
-<file path="src/app.rs">
-use crossterm::event::KeyEvent;
-use ratatui::prelude::Rect;
-use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
-use tracing::{debug, info};
-
-use crate::{
-    action::Action,
-    components::{Component, fps::FpsCounter, home::Home},
-    config::Config,
-    tui::{Event, Tui},
-};
-
-pub struct App {
-    config: Config,
-    tick_rate: f64,
-    frame_rate: f64,
-    components: Vec<Box<dyn Component>>,
-    should_quit: bool,
-    should_suspend: bool,
-    mode: Mode,
-    last_tick_key_events: Vec<KeyEvent>,
-    action_tx: mpsc::UnboundedSender<Action>,
-    action_rx: mpsc::UnboundedReceiver<Action>,
-}
-
-#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Mode {
-    #[default]
-    Home,
-}
-
-impl App {
-    pub fn new(tick_rate: f64, frame_rate: f64) -> color_eyre::Result<Self> {
-        let (action_tx, action_rx) = mpsc::unbounded_channel();
-        Ok(Self {
-            tick_rate,
-            frame_rate,
-            components: vec![Box::new(Home::new()), Box::new(FpsCounter::default())],
-            should_quit: false,
-            should_suspend: false,
-            config: Config::new()?,
-            mode: Mode::Home,
-            last_tick_key_events: Vec::new(),
-            action_tx,
-            action_rx,
-        })
-    }
-
-    pub async fn run(&mut self) -> color_eyre::Result<()> {
-        let mut tui = Tui::new()?
-            // .mouse(true) // uncomment this line to enable mouse support
-            .tick_rate(self.tick_rate)
-            .frame_rate(self.frame_rate);
-        tui.enter()?;
-
-        for component in self.components.iter_mut() {
-            component.register_action_handler(self.action_tx.clone())?;
-        }
-        for component in self.components.iter_mut() {
-            component.register_config_handler(self.config.clone())?;
-        }
-        for component in self.components.iter_mut() {
-            component.init(tui.size()?)?;
-        }
-
-        let action_tx = self.action_tx.clone();
-        loop {
-            self.handle_events(&mut tui).await?;
-            self.handle_actions(&mut tui)?;
-            if self.should_suspend {
-                tui.suspend()?;
-                action_tx.send(Action::Resume)?;
-                action_tx.send(Action::ClearScreen)?;
-                // tui.mouse(true);
-                tui.enter()?;
-            } else if self.should_quit {
-                tui.stop()?;
-                break;
-            }
-        }
-        tui.exit()?;
-        Ok(())
-    }
-
-    async fn handle_events(&mut self, tui: &mut Tui) -> color_eyre::Result<()> {
-        let Some(event) = tui.next_event().await else {
-            return Ok(());
-        };
-        let action_tx = self.action_tx.clone();
-        match event {
-            Event::Quit => action_tx.send(Action::Quit)?,
-            Event::Tick => action_tx.send(Action::Tick)?,
-            Event::Render => action_tx.send(Action::Render)?,
-            Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
-            Event::Key(key) => self.handle_key_event(key)?,
-            _ => {}
-        }
-        for component in self.components.iter_mut() {
-            if let Some(action) = component.handle_events(Some(event.clone()))? {
-                action_tx.send(action)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_key_event(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
-        let action_tx = self.action_tx.clone();
-        let Some(keymap) = self.config.keybindings.0.get(&self.mode) else {
-            return Ok(());
-        };
-        match keymap.get(&vec![key]) {
-            Some(action) => {
-                info!("Got action: {action:?}");
-                action_tx.send(action.clone())?;
-            }
-            _ => {
-                // If the key was not handled as a single key action,
-                // then consider it for multi-key combinations.
-                self.last_tick_key_events.push(key);
-
-                // Check for multi-key combinations
-                if let Some(action) = keymap.get(&self.last_tick_key_events) {
-                    info!("Got action: {action:?}");
-                    action_tx.send(action.clone())?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_actions(&mut self, tui: &mut Tui) -> color_eyre::Result<()> {
-        while let Ok(action) = self.action_rx.try_recv() {
-            if action != Action::Tick && action != Action::Render {
-                debug!("{action:?}");
-            }
-            match action {
-                Action::Tick => {
-                    self.last_tick_key_events.drain(..);
-                }
-                Action::Quit => self.should_quit = true,
-                Action::Suspend => self.should_suspend = true,
-                Action::Resume => self.should_suspend = false,
-                Action::ClearScreen => tui.terminal.clear()?,
-                Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
-                Action::Render => self.render(tui)?,
-                _ => {}
-            }
-            for component in self.components.iter_mut() {
-                if let Some(action) = component.update(action.clone())? {
-                    self.action_tx.send(action)?
-                };
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_resize(&mut self, tui: &mut Tui, w: u16, h: u16) -> color_eyre::Result<()> {
-        tui.resize(Rect::new(0, 0, w, h))?;
-        self.render(tui)?;
-        Ok(())
-    }
-
-    fn render(&mut self, tui: &mut Tui) -> color_eyre::Result<()> {
-        tui.draw(|frame| {
-            for component in self.components.iter_mut() {
-                if let Err(err) = component.draw(frame, frame.area()) {
-                    let _ = self
-                        .action_tx
-                        .send(Action::Error(format!("Failed to draw: {:?}", err)));
-                }
-            }
-        })?;
         Ok(())
     }
 }
@@ -1536,30 +1415,207 @@ pub fn init() -> color_eyre::Result<()> {
 }
 </file>
 
-<file path="src/main.rs">
-use clap::Parser;
-use cli::Cli;
+<file path="src/scanner.rs">
+use std::time::{Duration, Instant};
 
-use crate::app::App;
+use evdev::{Device, EventSummary, KeyCode};
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::{error, info, warn};
 
-mod action;
-mod app;
-mod cli;
-mod components;
-mod config;
-mod errors;
-mod logging;
-mod tui;
+use crate::action::Action;
+// And on Kali you'll need read access to /dev/input/event* — add your user to the input group or ship a udev rule, otherwise grab() fails and you're back to wedge-into-terminal mode.
+/// How long of a gap ends a scan burst without an Enter (bad read).
+const BURST_TIMEOUT: Duration = Duration::from_millis(400);
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
-    crate::errors::init()?;
-    crate::logging::init()?;
+fn find_scanner() -> Option<Device> {
+    // Manual override wins
+    if let Ok(path) = std::env::var("POCKET_SCAN_DEVICE") {
+        return Device::open(path).ok();
+    }
+    for (path, device) in evdev::enumerate() {
+        let name = device.name().unwrap_or("").to_lowercase();
+        // Match common HID wedge scanner names; tweak for yours
+        if name.contains("barcode") || name.contains("scanner") || name.contains("honeywell") {
+            info!("found scanner at {}: {}", path.display(), name);
+            return Device::open(path).ok();
+        }
+    }
+    None
+}
+fn key_to_char(code: KeyCode, shift: bool) -> Option<char> {
+    let raw = code.0;
+    // Linux keycodes are QWERTY-ordered, not alphabetical:
+    // KEY_Q..KEY_P = 16..=25, KEY_A..KEY_L = 30..=38, KEY_Z..KEY_M = 44..=50
+    let letter = |row: &[u8], idx: u16| -> char {
+        let c = row[idx as usize] as char;
+        if shift { c.to_ascii_uppercase() } else { c }
+    };
+    let c = match raw {
+        r if (KeyCode::KEY_Q.0..=KeyCode::KEY_P.0).contains(&r) => {
+            letter(b"qwertyuiop", r - KeyCode::KEY_Q.0)
+        }
+        r if (KeyCode::KEY_A.0..=KeyCode::KEY_L.0).contains(&r) => {
+            letter(b"asdfghjkl", r - KeyCode::KEY_A.0)
+        }
+        r if (KeyCode::KEY_Z.0..=KeyCode::KEY_M.0).contains(&r) => {
+            letter(b"zxcvbnm", r - KeyCode::KEY_Z.0)
+        }
+        r if (KeyCode::KEY_1.0..=KeyCode::KEY_9.0).contains(&r) => {
+            let d = r - KeyCode::KEY_1.0;
+            if !shift {
+                (b'1' + d as u8) as char
+            } else {
+                ['!', '@', '#', '$', '%', '^', '&', '*', '('][d as usize]
+            }
+        }
+        r if r == KeyCode::KEY_0.0 => {
+            if shift {
+                ')'
+            } else {
+                '0'
+            }
+        }
+        r if r == KeyCode::KEY_MINUS.0 => {
+            if shift {
+                '_'
+            } else {
+                '-'
+            }
+        }
+        r if r == KeyCode::KEY_EQUAL.0 => {
+            if shift {
+                '+'
+            } else {
+                '='
+            }
+        }
+        r if r == KeyCode::KEY_SLASH.0 => {
+            if shift {
+                '?'
+            } else {
+                '/'
+            }
+        }
+        r if r == KeyCode::KEY_DOT.0 => {
+            if shift {
+                '>'
+            } else {
+                '.'
+            }
+        }
+        r if r == KeyCode::KEY_COMMA.0 => {
+            if shift {
+                '<'
+            } else {
+                ','
+            }
+        }
+        r if r == KeyCode::KEY_SEMICOLON.0 => {
+            if shift {
+                ':'
+            } else {
+                ';'
+            }
+        }
+        r if r == KeyCode::KEY_APOSTROPHE.0 => {
+            if shift {
+                '"'
+            } else {
+                '\''
+            }
+        }
+        r if r == KeyCode::KEY_LEFTBRACE.0 => {
+            if shift {
+                '{'
+            } else {
+                '['
+            }
+        }
+        r if r == KeyCode::KEY_RIGHTBRACE.0 => {
+            if shift {
+                '}'
+            } else {
+                ']'
+            }
+        }
+        r if r == KeyCode::KEY_BACKSLASH.0 => {
+            if shift {
+                '|'
+            } else {
+                '\\'
+            }
+        }
+        r if r == KeyCode::KEY_GRAVE.0 => {
+            if shift {
+                '~'
+            } else {
+                '`'
+            }
+        }
+        r if r == KeyCode::KEY_SPACE.0 => ' ',
+        _ => return None,
+    };
+    Some(c)
+}
+/// Spawn the blocking scanner reader on its own thread.
+/// Returns Ok(false) if no scanner was found (app keeps running).
+pub fn spawn(tx: UnboundedSender<Action>) -> color_eyre::Result<bool> {
+    let Some(mut device) = find_scanner() else {
+        warn!("no scanner found; keyboard-wedge input will go to crossterm instead");
+        return Ok(false);
+    };
+    device.grab()?; // exclusive: keystrokes never reach the terminal
+    info!("scanner grabbed");
 
-    let args = Cli::parse();
-    let mut app = App::new(args.tick_rate, args.frame_rate)?;
-    app.run().await?;
-    Ok(())
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let mut shift = false;
+        let mut burst_start: Option<Instant> = None;
+
+        loop {
+            let events = match device.fetch_events() {
+                Ok(evs) => evs,
+                Err(e) => {
+                    error!("scanner read error: {e}");
+                    std::thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+            };
+            for event in events {
+                let EventSummary::Key(_, code, value) = event.destructure() else {
+                    continue;
+                };
+                match code {
+                    KeyCode::KEY_LEFTSHIFT | KeyCode::KEY_RIGHTSHIFT => {
+                        shift = value != 0;
+                        continue;
+                    }
+                    KeyCode::KEY_ENTER | KeyCode::KEY_KPENTER if value == 1 => {
+                        if !buf.is_empty() {
+                            let _ = tx.send(Action::Scan(std::mem::take(&mut buf)));
+                        }
+                        burst_start = None;
+                        continue;
+                    }
+                    _ => {}
+                }
+                if value != 1 {
+                    continue;
+                } // key-down only, ignore release & repeat
+
+                // First keystroke of a burst: throw sand immediately
+                if buf.is_empty() && burst_start.is_none_or(|t| t.elapsed() > BURST_TIMEOUT) {
+                    let _ = tx.send(Action::SandStart);
+                }
+                burst_start = Some(Instant::now());
+
+                if let Some(c) = key_to_char(code, shift) {
+                    buf.push(c);
+                }
+            }
+        }
+    });
+    Ok(true)
 }
 </file>
 
@@ -1804,6 +1860,8 @@ impl Drop for Tui {
 export POCKET_SCAN_CONFIG=`pwd`/.config
 export POCKET_SCAN_DATA=`pwd`/.data
 export POCKET_SCAN_LOG_LEVEL=debug
+export POCKET_SCAN_DEVICE=/dev/input/by-id/usb-WCM_HIDKeyBoard_00000000011C-event-kbd
+export POCKET_SCAN_LOG_LEVEL=info
 </file>
 
 <file path=".gitignore">
@@ -1860,6 +1918,505 @@ SOFTWARE.
 a qr link/data scanner & spammer for meshtastic & twitter
 </file>
 
+<file path="src/components/home.rs">
+use std::{
+    io::Cursor,
+    time::{Duration, Instant},
+};
+
+use ratatui::{prelude::*, widgets::*};
+use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
+use tokio::sync::mpsc::UnboundedSender;
+
+use super::Component;
+use crate::{action::Action, config::Config};
+
+static GIF_BYTES: &[u8] = include_bytes!("../../assets/pocket-sand.gif");
+
+enum Display {
+    Dashboard,
+    Sand {
+        started: Instant,
+        frame: usize,
+        last_advance: Instant,
+    },
+}
+
+pub struct Home {
+    command_tx: Option<UnboundedSender<Action>>,
+    config: Config,
+    display: Display,
+    frames: Vec<StatefulProtocol>,
+    frame_durations: Vec<Duration>,
+    gif_total: Duration,
+    sand_count: u64,
+    // dashboard state
+    mesh_connected: bool,
+    twitter_connected: bool,
+    last_scan: Option<Instant>,
+    log: Vec<String>,
+    pulse: u16, // loading bar animation
+}
+
+impl Default for Home {
+    fn default() -> Self {
+        Self {
+            command_tx: None,
+            config: Config::default(),
+            display: Display::Dashboard,
+            frames: Vec::new(),
+            frame_durations: Vec::new(),
+            gif_total: Duration::ZERO,
+            sand_count: 0,
+            mesh_connected: false,
+            twitter_connected: false,
+            last_scan: None,
+            log: Vec::new(),
+            pulse: 0,
+        }
+    }
+}
+
+impl Home {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn decode_gif(&mut self, area: Size) -> color_eyre::Result<()> {
+        use image::{AnimationDecoder, codecs::gif::GifDecoder};
+        let picker = Picker::halfblocks();
+        let decoder = GifDecoder::new(Cursor::new(GIF_BYTES))?;
+        let target_w = area.width as u32;
+        let target_h = area.height as u32 * 2; // halfblocks: 2 vertical pixels per cell
+        for frame in decoder.into_frames().collect_frames()? {
+            let (n, d) = frame.delay().numer_denom_ms();
+            let dur = Duration::from_secs_f64(n as f64 / d as f64 / 1000.0)
+                .max(Duration::from_millis(30));
+            self.frame_durations.push(dur);
+            self.gif_total += dur;
+            let img: image::DynamicImage = frame.into_buffer().into();
+            let img = img.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
+            self.frames.push(picker.new_resize_protocol(img));
+        }
+        Ok(())
+    }
+    fn status_block<'a>(title: &'a str, connected: bool, detail: String) -> Paragraph<'a> {
+        let color = if connected { Color::Green } else { Color::Red };
+        let state = if connected { "ONLINE" } else { "OFFLINE" };
+        Paragraph::new(vec![
+            Line::from(Span::styled(state, Style::new().fg(color).bold())),
+            Line::from(""),
+            Line::from(detail),
+        ])
+        .block(
+            Block::bordered()
+                .title(Span::styled(format!(" {title} "), Style::new().bold()))
+                .border_style(Style::new().fg(color)),
+        )
+        .alignment(Alignment::Center)
+    }
+}
+
+impl Component for Home {
+    fn register_action_handler(&mut self, tx: UnboundedSender<Action>) -> color_eyre::Result<()> {
+        self.command_tx = Some(tx);
+        Ok(())
+    }
+
+    fn register_config_handler(&mut self, config: Config) -> color_eyre::Result<()> {
+        self.config = config;
+        Ok(())
+    }
+
+    fn init(&mut self, area: Size) -> color_eyre::Result<()> {
+        // self.decode_gif()
+        self.decode_gif(area)
+    }
+
+    fn update(&mut self, action: Action) -> color_eyre::Result<Option<Action>> {
+        match action {
+            Action::SandStart => {
+                self.sand_count += 1;
+                self.display = Display::Sand {
+                    started: Instant::now(),
+                    frame: 0,
+                    last_advance: Instant::now(),
+                };
+            }
+            Action::Scan(payload) => {
+                self.last_scan = Some(Instant::now());
+                self.log.push(format!("SCAN  {payload}"));
+                // TODO later: forward to mesh + twitter workers via command_tx
+            }
+            Action::Tick => {
+                self.pulse = self.pulse.wrapping_add(1);
+                // GIF finished? back to the dashboard
+                if let Display::Sand { started, .. } = &self.display {
+                    if started.elapsed() >= self.gif_total {
+                        self.display = Display::Dashboard;
+                    }
+                }
+            }
+            Action::Render => {
+                if let Display::Sand {
+                    frame,
+                    last_advance,
+                    ..
+                } = &mut self.display
+                {
+                    if last_advance.elapsed() >= self.frame_durations[*frame] {
+                        *frame = (*frame + 1) % self.frames.len();
+                        *last_advance = Instant::now();
+                    }
+                }
+            }
+            Action::MeshStatus(connected) => {
+                self.mesh_connected = connected;
+                self.log.push(format!(
+                    "MESH  {}",
+                    if connected {
+                        "connected"
+                    } else {
+                        "disconnected — retrying"
+                    }
+                ));
+            }
+            Action::MeshTx { ok, text } => {
+                let short: String = text.chars().take(48).collect();
+                self.log.push(format!(
+                    "MESH  {} {short}",
+                    if ok { "→ sent" } else { "✗ FAILED" }
+                ));
+            }
+            Action::MeshRx { from, text } => {
+                let short: String = text.chars().take(48).collect();
+                self.log.push(format!("MESH  ← {from}: {short}"));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+
+    fn draw(&mut self, frame: &mut Frame, area: Rect) -> color_eyre::Result<()> {
+        // Sand mode: gif covers everything
+        if let Display::Sand { frame: idx, .. } = self.display {
+            if !self.frames.is_empty() {
+                frame.render_widget(Clear, area);
+                frame.render_stateful_widget(StatefulImage::default(), area, &mut self.frames[idx]);
+            }
+            return Ok(());
+        }
+
+        // Dashboard: two top tiles / loading bar / log pane
+        let [top, bar, bottom] = Layout::vertical([
+            Constraint::Percentage(55),
+            Constraint::Length(1),
+            Constraint::Min(4),
+        ])
+        .areas(area);
+        let [twitter_area, mesh_area] =
+            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).areas(top);
+
+        let last = self
+            .last_scan
+            .map(|t| format!("{}s ago", t.elapsed().as_secs()))
+            .unwrap_or_else(|| "never".into());
+
+        frame.render_widget(
+            Self::status_block(
+                "X / TWITTER",
+                self.twitter_connected,
+                format!("last post: {last}"),
+            ),
+            twitter_area,
+        );
+        frame.render_widget(
+            Self::status_block(
+                "MESHTASTIC",
+                self.mesh_connected,
+                format!("sand thrown: {}", self.sand_count),
+            ),
+            mesh_area,
+        );
+
+        let bar_fill = ((self.pulse as f32 * 0.08).sin() * 0.5 + 0.5) as f64;
+        frame.render_widget(
+            Gauge::default()
+                .gauge_style(Style::new().fg(Color::Yellow).bg(Color::Black))
+                .ratio(bar_fill),
+            bar,
+        );
+
+        let items: Vec<ListItem> = self
+            .log
+            .iter()
+            .rev()
+            .take(bottom.height.saturating_sub(2) as usize)
+            .map(|e| ListItem::new(e.clone()))
+            .collect();
+        frame.render_widget(
+            List::new(items).block(Block::bordered().title(" SCANS / POSTS ")),
+            bottom,
+        );
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/action.rs">
+use serde::{Deserialize, Serialize};
+use strum::Display;
+
+#[derive(Debug, Clone, PartialEq, Eq, Display, Serialize, Deserialize)]
+pub enum Action {
+    Tick,
+    Render,
+    Resize(u16, u16),
+    Suspend,
+    Resume,
+    Quit,
+    ClearScreen,
+    Error(String),
+    Help,
+
+    /// Scanner started firing (first keystroke of a scan burst)
+    SandStart,
+    /// Complete payload decoded (Enter received)
+    Scan(String),
+    /// Radio connection state changed
+    MeshStatus(bool),
+    /// Text message received from the mesh
+    MeshRx {
+        from: String,
+        text: String,
+    },
+    /// Result of an attempted mesh send
+    MeshTx {
+        ok: bool,
+        text: String,
+    },
+}
+</file>
+
+<file path="src/app.rs">
+use crossterm::event::KeyEvent;
+use ratatui::prelude::Rect;
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+use tracing::{debug, info};
+
+use crate::{
+    action::Action,
+    components::{Component, fps::FpsCounter, home::Home},
+    config::Config,
+    tui::{Event, Tui},
+};
+
+pub struct App {
+    config: Config,
+    tick_rate: f64,
+    frame_rate: f64,
+    components: Vec<Box<dyn Component>>,
+    should_quit: bool,
+    should_suspend: bool,
+    mode: Mode,
+    last_tick_key_events: Vec<KeyEvent>,
+    action_tx: mpsc::UnboundedSender<Action>,
+    action_rx: mpsc::UnboundedReceiver<Action>,
+    mesh_tx: Option<mpsc::UnboundedSender<String>>,
+}
+
+#[derive(Default, Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum Mode {
+    #[default]
+    Home,
+}
+
+impl App {
+    pub fn new(tick_rate: f64, frame_rate: f64) -> color_eyre::Result<Self> {
+        let (action_tx, action_rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            tick_rate,
+            frame_rate,
+            components: vec![Box::new(Home::new()), Box::new(FpsCounter::default())],
+            should_quit: false,
+            should_suspend: false,
+            config: Config::new()?,
+            mode: Mode::Home,
+            last_tick_key_events: Vec::new(),
+            action_tx,
+            action_rx,
+            mesh_tx: None,
+        })
+    }
+
+    pub async fn run(&mut self) -> color_eyre::Result<()> {
+        let mut tui = Tui::new()?
+            // .mouse(true) // uncomment this line to enable mouse support
+            .tick_rate(self.tick_rate)
+            .frame_rate(self.frame_rate);
+        tui.enter()?;
+        if let Err(e) = crate::scanner::spawn(self.action_tx.clone()) {
+            tracing::error!("scanner init failed: {e}");
+        }
+        for component in self.components.iter_mut() {
+            component.register_action_handler(self.action_tx.clone())?;
+        }
+        for component in self.components.iter_mut() {
+            component.register_config_handler(self.config.clone())?;
+        }
+        for component in self.components.iter_mut() {
+            component.init(tui.size()?)?;
+        }
+        let (mesh_tx, mesh_rx) = mpsc::unbounded_channel::<String>();
+        self.mesh_tx = Some(mesh_tx.clone());
+        crate::mesh::spawn(self.action_tx.clone(), mesh_rx);
+        let action_tx = self.action_tx.clone();
+        loop {
+            self.handle_events(&mut tui).await?;
+            self.handle_actions(&mut tui)?;
+            if self.should_suspend {
+                tui.suspend()?;
+                action_tx.send(Action::Resume)?;
+                action_tx.send(Action::ClearScreen)?;
+                // tui.mouse(true);
+                tui.enter()?;
+            } else if self.should_quit {
+                tui.stop()?;
+                break;
+            }
+        }
+        tui.exit()?;
+        Ok(())
+    }
+
+    async fn handle_events(&mut self, tui: &mut Tui) -> color_eyre::Result<()> {
+        let Some(event) = tui.next_event().await else {
+            return Ok(());
+        };
+        let action_tx = self.action_tx.clone();
+        match event {
+            Event::Quit => action_tx.send(Action::Quit)?,
+            Event::Tick => action_tx.send(Action::Tick)?,
+            Event::Render => action_tx.send(Action::Render)?,
+            Event::Resize(x, y) => action_tx.send(Action::Resize(x, y))?,
+            Event::Key(key) => self.handle_key_event(key)?,
+            _ => {}
+        }
+        for component in self.components.iter_mut() {
+            if let Some(action) = component.handle_events(Some(event.clone()))? {
+                action_tx.send(action)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_key_event(&mut self, key: KeyEvent) -> color_eyre::Result<()> {
+        let action_tx = self.action_tx.clone();
+        let Some(keymap) = self.config.keybindings.0.get(&self.mode) else {
+            return Ok(());
+        };
+        match keymap.get(&vec![key]) {
+            Some(action) => {
+                info!("Got action: {action:?}");
+                action_tx.send(action.clone())?;
+            }
+            _ => {
+                // If the key was not handled as a single key action,
+                // then consider it for multi-key combinations.
+                self.last_tick_key_events.push(key);
+
+                // Check for multi-key combinations
+                if let Some(action) = keymap.get(&self.last_tick_key_events) {
+                    info!("Got action: {action:?}");
+                    action_tx.send(action.clone())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_actions(&mut self, tui: &mut Tui) -> color_eyre::Result<()> {
+        while let Ok(action) = self.action_rx.try_recv() {
+            if action != Action::Tick && action != Action::Render {
+                debug!("{action:?}");
+            }
+            match action {
+                Action::Tick => {
+                    self.last_tick_key_events.drain(..);
+                }
+                Action::Quit => self.should_quit = true,
+                Action::Suspend => self.should_suspend = true,
+                Action::Resume => self.should_suspend = false,
+                Action::ClearScreen => tui.terminal.clear()?,
+                Action::Resize(w, h) => self.handle_resize(tui, w, h)?,
+                Action::Render => self.render(tui)?,
+                Action::Scan(ref payload) => {
+                    if let Some(tx) = &self.mesh_tx {
+                        let _ = tx.send(payload.clone());
+                    }
+                }
+                _ => {}
+            }
+            for component in self.components.iter_mut() {
+                if let Some(action) = component.update(action.clone())? {
+                    self.action_tx.send(action)?
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_resize(&mut self, tui: &mut Tui, w: u16, h: u16) -> color_eyre::Result<()> {
+        tui.resize(Rect::new(0, 0, w, h))?;
+        self.render(tui)?;
+        Ok(())
+    }
+
+    fn render(&mut self, tui: &mut Tui) -> color_eyre::Result<()> {
+        tui.draw(|frame| {
+            for component in self.components.iter_mut() {
+                if let Err(err) = component.draw(frame, frame.area()) {
+                    let _ = self
+                        .action_tx
+                        .send(Action::Error(format!("Failed to draw: {:?}", err)));
+                }
+            }
+        })?;
+        Ok(())
+    }
+}
+</file>
+
+<file path="src/main.rs">
+use clap::Parser;
+use cli::Cli;
+
+use crate::app::App;
+
+mod action;
+mod app;
+mod cli;
+mod components;
+mod config;
+mod errors;
+mod logging;
+mod tui;
+
+mod mesh;
+mod scanner;
+
+#[tokio::main]
+async fn main() -> color_eyre::Result<()> {
+    crate::errors::init()?;
+    crate::logging::init()?;
+
+    let args = Cli::parse();
+    let mut app = App::new(args.tick_rate, args.frame_rate)?;
+    app.run().await?;
+    Ok(())
+}
+</file>
+
 <file path="Cargo.toml">
 [package]
 name = "pocket-scan"
@@ -1894,7 +2451,8 @@ libc = "0.2.186"
 meshtastic = "0.1.9"
 pretty_assertions = "1.4.1"
 ratatui = { version = "0.30.2", features = ["serde", "macros"] }
-ratatui-image = "11.0.6"
+ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"]}
+image= {version = "0.25", default-features = false, features = ["gif"]}
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 signal-hook = "0.4.4"

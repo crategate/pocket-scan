@@ -3,12 +3,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ratatui::{prelude::*, widgets::*};
-use ratatui_image::{StatefulImage, picker::Picker, protocol::StatefulProtocol};
-use tokio::sync::mpsc::UnboundedSender;
-
 use super::Component;
 use crate::{action::Action, config::Config};
+use ratatui::{prelude::*, widgets::*};
+use ratatui_image::{Image, Resize, picker::Picker, protocol::Protocol};
+use tokio::sync::mpsc::UnboundedSender;
+use tracing::info;
 
 static GIF_BYTES: &[u8] = include_bytes!("../../assets/pocket-sand.gif");
 
@@ -25,7 +25,7 @@ pub struct Home {
     command_tx: Option<UnboundedSender<Action>>,
     config: Config,
     display: Display,
-    frames: Vec<StatefulProtocol>,
+    frames: Vec<Protocol>,
     frame_durations: Vec<Duration>,
     gif_total: Duration,
     sand_count: u64,
@@ -35,6 +35,8 @@ pub struct Home {
     last_scan: Option<Instant>,
     log: Vec<String>,
     pulse: u16, // loading bar animation
+    x_posts: u64,
+    x_cents: u64,
 }
 
 impl Default for Home {
@@ -52,6 +54,8 @@ impl Default for Home {
             last_scan: None,
             log: Vec::new(),
             pulse: 0,
+            x_posts: 0,
+            x_cents: 0,
         }
     }
 }
@@ -60,36 +64,60 @@ impl Home {
     pub fn new() -> Self {
         Self::default()
     }
-
-    fn decode_gif(&mut self) -> color_eyre::Result<()> {
+    fn decode_gif(&mut self, area: Size) -> color_eyre::Result<()> {
         use image::{AnimationDecoder, codecs::gif::GifDecoder};
-        let picker = Picker::halfblocks(); // deterministic: no terminal protocol dependency
+        let picker = Picker::halfblocks();
+        let fs = picker.font_size(); // (10, 20) for halfblocks
+        let target_w = area.width as u32 * fs.width as u32;
+        let target_h = area.height as u32 * fs.height as u32;
         let decoder = GifDecoder::new(Cursor::new(GIF_BYTES))?;
+        info!("decode_gif start: {}x{} cells", area.width, area.height);
         for frame in decoder.into_frames().collect_frames()? {
             let (n, d) = frame.delay().numer_denom_ms();
             let dur = Duration::from_secs_f64(n as f64 / d as f64 / 1000.0)
                 .max(Duration::from_millis(30));
             self.frame_durations.push(dur);
             self.gif_total += dur;
+            let img: image::DynamicImage = frame.into_buffer().into();
+            let img = img.resize_exact(target_w, target_h, image::imageops::FilterType::Triangle);
             self.frames
-                .push(picker.new_resize_protocol(frame.into_buffer().into()));
+                .push(picker.new_protocol(img, area, Resize::Fit(None))?);
         }
+        info!(
+            "decode_gif done: {} frames, total {:?}",
+            self.frames.len(),
+            self.gif_total
+        );
         Ok(())
     }
 
     fn status_block<'a>(title: &'a str, connected: bool, detail: String) -> Paragraph<'a> {
-        let color = if connected { Color::Green } else { Color::Red };
+        let border_color = if connected { Color::Green } else { Color::Red };
         let state = if connected { "ONLINE" } else { "OFFLINE" };
+
+        // Base style: light red alert fill when down, default black when up
+        let base = if connected {
+            Style::default()
+        } else {
+            Style::new().bg(Color::LightRed).fg(Color::Black)
+        };
+        let state_style = if connected {
+            Style::new().fg(Color::Green).bold()
+        } else {
+            Style::new().fg(Color::Black).bold()
+        };
+
         Paragraph::new(vec![
-            Line::from(Span::styled(state, Style::new().fg(color).bold())),
+            Line::from(Span::styled(state, state_style)),
             Line::from(""),
-            Line::from(detail),
+            Line::from(Span::styled(detail, base)),
         ])
         .block(
             Block::bordered()
                 .title(Span::styled(format!(" {title} "), Style::new().bold()))
-                .border_style(Style::new().fg(color)),
+                .border_style(Style::new().fg(border_color)),
         )
+        .style(base)
         .alignment(Alignment::Center)
     }
 }
@@ -105,8 +133,9 @@ impl Component for Home {
         Ok(())
     }
 
-    fn init(&mut self, _area: Size) -> color_eyre::Result<()> {
-        self.decode_gif()
+    fn init(&mut self, area: Size) -> color_eyre::Result<()> {
+        // self.decode_gif()
+        self.decode_gif(area)
     }
 
     fn update(&mut self, action: Action) -> color_eyre::Result<Option<Action>> {
@@ -146,6 +175,50 @@ impl Component for Home {
                     }
                 }
             }
+            Action::MeshStatus(connected) => {
+                self.mesh_connected = connected;
+                self.log.push(format!(
+                    "MESH  {}",
+                    if connected {
+                        "connected"
+                    } else {
+                        "disconnected — retrying"
+                    }
+                ));
+            }
+            Action::MeshTx { ok, text } => {
+                let short: String = text.chars().take(48).collect();
+                self.log.push(format!(
+                    "MESH  {} {short}",
+                    if ok { "→ sent" } else { "✗ FAILED" }
+                ));
+            }
+            Action::MeshRx { from, text } => {
+                let short: String = text.chars().take(48).collect();
+                self.log.push(format!("MESH  ← {from}: {short}"));
+            }
+            Action::XStatus(connected) => {
+                self.twitter_connected = connected;
+                self.log.push(format!(
+                    "X     {}",
+                    if connected {
+                        "creds loaded"
+                    } else {
+                        "no creds — idle"
+                    }
+                ));
+            }
+            Action::XTx { ok, text } => {
+                if ok {
+                    self.x_posts += 1;
+                    self.x_cents += if text.contains("http") { 20 } else { 2 }; // $0.20 / $0.015
+                }
+                let short: String = text.chars().take(48).collect();
+                self.log.push(format!(
+                    "X     {} {short}",
+                    if ok { "→ posted" } else { "✗" }
+                ));
+            }
             _ => {}
         }
         Ok(None)
@@ -156,7 +229,7 @@ impl Component for Home {
         if let Display::Sand { frame: idx, .. } = self.display {
             if !self.frames.is_empty() {
                 frame.render_widget(Clear, area);
-                frame.render_stateful_widget(StatefulImage::default(), area, &mut self.frames[idx]);
+                frame.render_widget(Image::new(&self.frames[idx]), area);
             }
             return Ok(());
         }
@@ -180,7 +253,11 @@ impl Component for Home {
             Self::status_block(
                 "X / TWITTER",
                 self.twitter_connected,
-                format!("last post: {last}"),
+                format!(
+                    "posts: {} | damage: ${:.2}",
+                    self.x_posts,
+                    self.x_cents as f64 / 100.0
+                ),
             ),
             twitter_area,
         );
@@ -193,13 +270,13 @@ impl Component for Home {
             mesh_area,
         );
 
-        let bar_fill = ((self.pulse as f32 * 0.08).sin() * 0.5 + 0.5) as f64;
-        frame.render_widget(
-            Gauge::default()
-                .gauge_style(Style::new().fg(Color::Yellow).bg(Color::Black))
-                .ratio(bar_fill),
-            bar,
-        );
+        //        let bar_fill = ((self.pulse as f32 * 0.08).sin() * 0.5 + 0.5) as f64;
+        //        frame.render_widget(
+        //            Gauge::default()
+        //                .gauge_style(Style::new().fg(Color::Yellow).bg(Color::Black))
+        //                .ratio(bar_fill),
+        //            bar,
+        //        );
 
         let items: Vec<ListItem> = self
             .log
@@ -215,4 +292,3 @@ impl Component for Home {
         Ok(())
     }
 }
-

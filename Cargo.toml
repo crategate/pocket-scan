@@ -8,7 +8,11 @@ build = "build.rs"
 repository = "https://github.com/crategate/pocket-scan"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[profile.dev.package.image]
+opt-level = 3
 
+[profile.dev.package.gif]
+opt-level = 3
 [dependencies]
 better-panic = "0.3.0"
 clap = { version = "4.6.1", features = [
@@ -43,7 +47,10 @@ tokio-util = "0.7.18"
 tracing = "0.1.44"
 tracing-error = "0.2.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "serde"] }
-
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart"] }
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
 [build-dependencies]
 anyhow = "1.0.103"
 vergen-gix = { version = "10.0.1", features = ["build", "cargo"] }
