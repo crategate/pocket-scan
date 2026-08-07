@@ -16,7 +16,7 @@ use crate::action::Action;
 const MESH_CHANNEL: u32 = 0;
 const SERIAL_PORT: &str = "/dev/ttyACM0";
 /// LoRa text payloads top out ~230 bytes; stay well under
-const MAX_PAYLOAD_BYTES: usize = 200;
+const MAX_PAYLOAD_BYTES: usize = 210;
 
 /// Router required by send_text (used for packet echo bookkeeping).
 struct ScanRouter {
@@ -36,16 +36,9 @@ impl PacketRouter<(), std::io::Error> for ScanRouter {
 }
 
 fn truncate_payload(s: &str) -> String {
-    if s.len() <= MAX_PAYLOAD_BYTES {
-        return s.to_string();
-    }
-    let mut end = MAX_PAYLOAD_BYTES;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
+    let msg = format!("Pocket Scan!\n{s}");
+    msg.chars().take(MAX_PAYLOAD_BYTES).collect()
 }
-
 /// Spawn the mesh worker task. `outbound` receives scan payloads to broadcast.
 /// Reconnects forever if the radio is missing or drops.
 pub fn spawn(action_tx: UnboundedSender<Action>, mut outbound: UnboundedReceiver<String>) {
